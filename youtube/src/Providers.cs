@@ -269,6 +269,9 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
 
             // Log candidate prior to filtering, with tab context
             Diag.Print($"[WEB][LIST {tab}] id={id} | title={title} | viewsText={viewsText} | publishedText={(publishedText ?? "(없음)")}");
+            bool alwaysDbg = AlwaysDebug.EnabledFor(id);
+            if (alwaysDbg)
+                Console.WriteLine($"[DBG][LIST {tab}] id={id} | publishedText={(publishedText ?? "(없음)")} | within48(list)={IsWithin48Hours(publishedText)}");
 
             bool isShortsTab = string.Equals(tab, "shorts", StringComparison.OrdinalIgnoreCase);
 
@@ -294,12 +297,16 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             }
             else
             {
-                // Videos/Streams: only fetch detail if list-time indicates within 48 hours
-                if (!IsWithin48Hours(publishedText)) continue;
-                var det = await GetWatchDetailsAsync(id);
-                effectivePublished = det.publishedText ?? publishedText;
-                effectiveViews = det.viewCount ?? views;
-                if (!IsWithin48Hours(effectivePublished)) continue;
+                // Videos/Streams: trust list-time; if it's within 48h, do NOT override with detail page
+                if (!IsWithin48Hours(publishedText))
+                {
+                    if (alwaysDbg)
+                        Console.WriteLine($"[DBG][SKIP {tab}] id={id} | reason=list-within48=false");
+                    continue;
+                }
+                if (alwaysDbg)
+                    Console.WriteLine($"[DBG][TRUST {tab}] id={id} | reason=list-within48=true (skip detail)");
+                // keep effectivePublished/effectiveViews as from list
             }
 
             Diag.Print($"[WEB][ADD {tab}] id={id} | published={(effectivePublished ?? "(없음)")} | views={(effectiveViews?.ToString() ?? "-")}");
