@@ -22,6 +22,9 @@ public static class Program
 
         var apiKey = Environment.GetEnvironmentVariable("YOUTUBE_API_KEY");
 
+        Console.WriteLine($"Handle: {handle}");
+        Console.WriteLine($"Mode: {(string.IsNullOrWhiteSpace(apiKey) ? "Web" : "API")}");
+
         using var http = new HttpClient();
         http.DefaultRequestHeaders.UserAgent.ParseAdd("codex-cli-youtube/1.0");
 

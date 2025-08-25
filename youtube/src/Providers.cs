@@ -18,8 +18,14 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
 
     public async Task<List<VideoInfo>> GetRecentAsync(string handle, int maxResults)
     {
+        Console.WriteLine($"[API] Resolving channelId for {handle} ...");
         var channelId = await GetChannelIdByHandleAsync(handle);
-        if (channelId is null) return new List<VideoInfo>();
+        if (channelId is null)
+        {
+            Console.WriteLine("[API] channelId not found.");
+            return new List<VideoInfo>();
+        }
+        Console.WriteLine($"[API] channelId: {channelId}");
 
         var ids = await GetRecentVideoIdsAsync(channelId, Math.Clamp(maxResults, 1, 50));
         if (ids.Count == 0) return new List<VideoInfo>();
@@ -118,34 +124,183 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
 
     public async Task<List<VideoInfo>> GetRecentAsync(string handle, int maxResults)
     {
-        // Use the public channel videos page and parse ytInitialData JSON.
-        var url = $"https://www.youtube.com/{Uri.EscapeDataString(handle)}/videos?hl=en";
+        var results = new List<VideoInfo>();
+
+        // Videos tab: also logs channelId once
+        await AppendFromTabAsync(handle, "videos", Math.Max(1, maxResults - results.Count), results, logChannelId: true);
+
+        // Streams tab
+        if (results.Count < maxResults)
+            await AppendFromTabAsync(handle, "streams", maxResults - results.Count, results);
+
+        // Shorts tab
+        if (results.Count < maxResults)
+            await AppendFromTabAsync(handle, "shorts", maxResults - results.Count, results);
+
+        return results;
+    }
+
+    private async Task AppendFromTabAsync(string handle, string tab, int remaining, List<VideoInfo> sink, bool logChannelId = false)
+    {
+        if (remaining <= 0) return;
+        Console.WriteLine($"[WEB] Fetching /{tab} ...");
+        var url = $"https://www.youtube.com/{Uri.EscapeDataString(handle)}/{tab}?hl=ko";
         using var resp = await _http.GetAsync(url);
         resp.EnsureSuccessStatusCode();
         var html = await resp.Content.ReadAsStringAsync();
 
         var json = ExtractJsonBlock(html, "ytInitialData");
-        if (json is null) return new List<VideoInfo>();
+        if (json is null) return;
 
         using var doc = JsonDocument.Parse(json);
-        var videos = new List<VideoInfo>();
+        if (logChannelId)
+        {
+            Console.WriteLine($"[WEB] Resolving channelId for {handle} ...");
+            var channelId = FindChannelId(doc.RootElement);
+            Console.WriteLine(channelId is null ? "[WEB] channelId not found (parsing)." : $"[WEB] channelId: {channelId}");
+        }
 
+        int added = 0;
+        int shortsDetailUsed = 0;
         foreach (var renderer in FindVideoRenderers(doc.RootElement))
         {
             var id = TryGetString(renderer, ["videoId"]) ?? string.Empty;
             if (string.IsNullOrWhiteSpace(id)) continue;
+            if (sink.Any(v => v.Id == id)) continue; // de-dup across tabs
 
-            var title = TryGetText(renderer, ["title"]) ?? "(제목 없음)";
-            var viewsText = TryGetText(renderer, ["viewCountText"]) ?? string.Empty;
+            // title: use title -> headline (shorts) fallback
+            var title = TryGetText(renderer, ["title"]) ??
+                        TryGetText(renderer, ["headline"]) ??
+                        "(제목 없음)";
+
+            // views: prefer explicit field, fallback to accessibility label
+            var viewsText = TryGetText(renderer, ["viewCountText"]) ??
+                            TryGetText(renderer, ["accessibility", "accessibilityData", "label"]) ??
+                            string.Empty;
             long? views = ParseFirstNumber(viewsText);
 
-            videos.Add(new VideoInfo(id, title, views, null, null));
-            if (videos.Count >= maxResults) break;
-        }
+            // Published text raw
+            var publishedText = TryGetText(renderer, ["publishedTimeText"]) ??
+                                TryGetText(renderer, ["accessibility", "accessibilityData", "label"]);
 
-        // Note: Like/Comment counts are not reliably present on the channel videos page HTML
-        // without client-side calls. Leaving them null here.
-        return videos;
+            // Log candidate prior to filtering, with tab context
+            Console.WriteLine($"[WEB][LIST {tab}] id={id} | title={title} | viewsText={viewsText} | publishedText={(publishedText ?? "(없음)")}");
+
+            bool isShortsTab = string.Equals(tab, "shorts", StringComparison.OrdinalIgnoreCase);
+
+            string? effectivePublished = publishedText;
+            long? effectiveViews = views;
+
+            if (isShortsTab)
+            {
+                // Shorts: always fetch detail for first 2 to get time; others are skipped
+                if (shortsDetailUsed < 2)
+                {
+                    var det = await GetWatchDetailsAsync(id);
+                    effectivePublished = det.publishedText ?? publishedText;
+                    effectiveViews = det.viewCount ?? views;
+                    shortsDetailUsed++;
+                    if (!IsWithin48Hours(effectivePublished)) continue;
+                }
+                else
+                {
+                    // Skip remaining shorts because list-time is unreliable and detail budget is limited
+                    continue;
+                }
+            }
+            else
+            {
+                // Videos/Streams: only fetch detail if list-time indicates within 48 hours
+                if (!IsWithin48Hours(publishedText)) continue;
+                var det = await GetWatchDetailsAsync(id);
+                effectivePublished = det.publishedText ?? publishedText;
+                effectiveViews = det.viewCount ?? views;
+                if (!IsWithin48Hours(effectivePublished)) continue;
+            }
+
+            Console.WriteLine($"[WEB][ADD {tab}] id={id} | published={(effectivePublished ?? "(없음)")} | views={(effectiveViews?.ToString() ?? "-")}");
+            sink.Add(new VideoInfo(id, title, effectiveViews, null, null));
+            added++;
+            if (added >= remaining) break;
+        }
+    }
+
+    private async Task<(string? publishedText, long? viewCount)> GetWatchDetailsAsync(string videoId)
+    {
+        try
+        {
+            var url = $"https://www.youtube.com/watch?v={Uri.EscapeDataString(videoId)}&hl=ko";
+            using var resp = await _http.GetAsync(url);
+            resp.EnsureSuccessStatusCode();
+            var html = await resp.Content.ReadAsStringAsync();
+
+            // Extract player response for viewCount
+            long? viewCount = null;
+            var pr = ExtractJsonBlock(html, "ytInitialPlayerResponse");
+            if (pr is not null)
+            {
+                using var prDoc = JsonDocument.Parse(pr);
+                var vd = TryGet(prDoc.RootElement, ["videoDetails", "viewCount"]);
+                if (vd is not null && vd.Value.ValueKind == JsonValueKind.String)
+                {
+                    if (long.TryParse(vd.Value.GetString(), out var vc)) viewCount = vc;
+                }
+            }
+
+            // Extract initial data for published text/date
+            string? published = null;
+            var idata = ExtractJsonBlock(html, "ytInitialData");
+            if (idata is not null)
+            {
+                using var idDoc = JsonDocument.Parse(idata);
+                // Try publishedTimeText or dateText
+                published = FindFirstTextByKeys(idDoc.RootElement, new[] { "publishedTimeText", "dateText" });
+                if (string.IsNullOrWhiteSpace(published))
+                {
+                    // Try microformat publishDate (ISO yyyy-MM-dd)
+                    var pf = TryGet(idDoc.RootElement, ["microformat", "microformatDataRenderer", "publishDate"]);
+                    if (pf is not null && pf.Value.ValueKind == JsonValueKind.String)
+                    {
+                        var d = pf.Value.GetString();
+                        if (!string.IsNullOrWhiteSpace(d)) published = d;
+                    }
+                }
+            }
+
+            return (published, viewCount);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WEB][DETAIL] {videoId} detail fetch error: {ex.Message}");
+            return (null, null);
+        }
+    }
+
+    private static string? FindFirstTextByKeys(JsonElement root, string[] keys)
+    {
+        var stack = new Stack<JsonElement>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var cur = stack.Pop();
+            if (cur.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in cur.EnumerateObject())
+                {
+                    if (keys.Any(k => prop.NameEquals(k)))
+                    {
+                        var t = TryGetText(prop.Value, Array.Empty<string>());
+                        if (!string.IsNullOrWhiteSpace(t)) return t;
+                    }
+                    stack.Push(prop.Value);
+                }
+            }
+            else if (cur.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in cur.EnumerateArray()) stack.Push(item);
+            }
+        }
+        return null;
     }
 
     private static IEnumerable<JsonElement> FindVideoRenderers(JsonElement root)
@@ -159,6 +314,7 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             {
                 if (cur.TryGetProperty("gridVideoRenderer", out var gvr)) yield return gvr;
                 if (cur.TryGetProperty("videoRenderer", out var vr)) yield return vr;
+                if (cur.TryGetProperty("reelItemRenderer", out var rr)) yield return rr; // Shorts
                 foreach (var prop in cur.EnumerateObject())
                     stack.Push(prop.Value);
             }
@@ -167,6 +323,35 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
                 foreach (var item in cur.EnumerateArray()) stack.Push(item);
             }
         }
+    }
+
+    private static string? FindChannelId(JsonElement root)
+    {
+        var stack = new Stack<JsonElement>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var cur = stack.Pop();
+            if (cur.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in cur.EnumerateObject())
+                {
+                    if ((prop.NameEquals("channelId") || prop.NameEquals("externalId") || prop.NameEquals("browseId"))
+                        && prop.Value.ValueKind == JsonValueKind.String)
+                    {
+                        var id = prop.Value.GetString();
+                        if (!string.IsNullOrWhiteSpace(id) && id.StartsWith("UC"))
+                            return id;
+                    }
+                    stack.Push(prop.Value);
+                }
+            }
+            else if (cur.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in cur.EnumerateArray()) stack.Push(item);
+            }
+        }
+        return null;
     }
 
     private static string? ExtractJsonBlock(string html, string marker)
@@ -246,5 +431,49 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
         if (!m.Success) return null;
         var digits = new string(m.Groups[1].Value.Where(ch => char.IsDigit(ch)).ToArray());
         return long.TryParse(digits, out var v) ? v : null;
+    }
+
+    private static bool IsWithin48Hours(string? publishedText)
+    {
+        if (string.IsNullOrWhiteSpace(publishedText)) return false;
+        var s = publishedText.Trim().ToLowerInvariant();
+
+        // Treat live indicators as within 48h
+        if (s.Contains("live now") || s.Contains("실시간") || s.Contains("라이브") || s.Contains("스트리밍 중"))
+            return true;
+
+        // English pattern: "X unit ago"
+        var mEn = Regex.Match(s, @"(\d+)\s+(second|minute|hour|day)s?\s+ago");
+        if (mEn.Success)
+        {
+            int val = int.Parse(mEn.Groups[1].Value);
+            string unit = mEn.Groups[2].Value;
+            return unit switch
+            {
+                "second" => true,
+                "minute" => true,
+                "hour" => val < 48,
+                "day" => val < 2,
+                _ => false
+            };
+        }
+
+        // Korean pattern: "X단위 전" (초/분/시간/일)
+        var mKo = Regex.Match(s, @"(\d+)\s*(초|분|시간|일)\s*전");
+        if (mKo.Success)
+        {
+            int val = int.Parse(mKo.Groups[1].Value);
+            string unit = mKo.Groups[2].Value;
+            return unit switch
+            {
+                "초" => true,
+                "분" => true,
+                "시간" => val < 48,
+                "일" => val < 2,
+                _ => false
+            };
+        }
+
+        return false;
     }
 }
