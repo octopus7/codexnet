@@ -1,0 +1,63 @@
+# Build outputs
+bin/
+obj/
+out/
+publish/
+
+# Configurations
+Debug/
+Release/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.csproj.user
+*.userprefs
+
+# IDE settings
+.vs/
+.idea/
+*.sln.iml
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# NuGet
+[Pp]ackages/
+*.nupkg
+*.snupkg
+
+# Logs and backups
+*.log
+*.bak
+*.swp
+*.tmp
+
+# Test results and coverage
+TestResults/
+*.trx
+*.coverage*
+coverage/
+.coverage/
+.coverlet/
+*.lcov
+TestResult.xml
+nunit-*.xml
+
+# Tooling caches
+.sonarqube/
+.scannerwork/
+.nyc_output/
+
+# ASP.NET/launch settings (often environment-specific)
+Properties/launchSettings.json
+
+# Rider/Resharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
