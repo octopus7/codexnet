@@ -11,7 +11,7 @@ public record VideoInfo(string Id, string Title, long? ViewCount, long? LikeCoun
 
 public interface IVideoProvider
 {
-    Task<List<VideoInfo>> GetRecentAsync(string handle, int maxResults);
+    Task<List<VideoInfo>> GetRecentAsync(string handle, int maxResults, int daysWindow);
 }
 
 public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoProvider
@@ -19,7 +19,7 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
     private readonly HttpClient _http = http;
     private readonly string _apiKey = apiKey;
 
-    public async Task<List<VideoInfo>> GetRecentAsync(string handle, int maxResults)
+    public async Task<List<VideoInfo>> GetRecentAsync(string handle, int maxResults, int daysWindow)
     {
         Console.WriteLine($"[API] Resolving channelId for {handle} ...");
         var channelId = await GetChannelIdByHandleAsync(handle);
@@ -32,7 +32,7 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
         var subsText = await GetSubscriberTextAsync(channelId);
         Console.WriteLine($"[API] subscribers: {subsText}");
 
-        var ids = await GetRecentVideoIdsAsync(channelId, Math.Clamp(maxResults, 1, 50));
+        var ids = await GetRecentVideoIdsAsync(channelId, Math.Clamp(maxResults, 1, 50), daysWindow);
         if (ids.Count == 0) return new List<VideoInfo>();
 
         var details = await GetVideoDetailsAsync(ids);
@@ -85,9 +85,10 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
         }
     }
 
-    private async Task<List<string>> GetRecentVideoIdsAsync(string channelId, int maxResults)
+    private async Task<List<string>> GetRecentVideoIdsAsync(string channelId, int maxResults, int daysWindow)
     {
-        var url = $"https://www.googleapis.com/youtube/v3/search?part=id&order=date&channelId={Uri.EscapeDataString(channelId)}&type=video&maxResults={maxResults}&key={Uri.EscapeDataString(_apiKey)}";
+        var publishedAfter = DateTime.UtcNow.AddDays(-Math.Max(1, daysWindow)).ToString("o");
+        var url = $"https://www.googleapis.com/youtube/v3/search?part=id&order=date&channelId={Uri.EscapeDataString(channelId)}&type=video&maxResults={maxResults}&publishedAfter={Uri.EscapeDataString(publishedAfter)}&key={Uri.EscapeDataString(_apiKey)}";
         using var resp = await _http.GetAsync(url);
         resp.EnsureSuccessStatusCode();
         using var stream = await resp.Content.ReadAsStreamAsync();
@@ -192,25 +193,25 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
 {
     private readonly HttpClient _http = http;
 
-    public async Task<List<VideoInfo>> GetRecentAsync(string handle, int maxResults)
+    public async Task<List<VideoInfo>> GetRecentAsync(string handle, int maxResults, int daysWindow)
     {
         var results = new List<VideoInfo>();
 
         // Videos tab: also logs channelId once
-        await AppendFromTabAsync(handle, "videos", Math.Max(1, maxResults - results.Count), results, logChannelId: true);
+        await AppendFromTabAsync(handle, "videos", Math.Max(1, maxResults - results.Count), results, daysWindow, logChannelId: true);
 
         // Streams tab
         if (results.Count < maxResults)
-            await AppendFromTabAsync(handle, "streams", maxResults - results.Count, results);
+            await AppendFromTabAsync(handle, "streams", maxResults - results.Count, results, daysWindow);
 
         // Shorts tab
         if (results.Count < maxResults)
-            await AppendFromTabAsync(handle, "shorts", maxResults - results.Count, results);
+            await AppendFromTabAsync(handle, "shorts", maxResults - results.Count, results, daysWindow);
 
         return results;
     }
 
-    private async Task AppendFromTabAsync(string handle, string tab, int remaining, List<VideoInfo> sink, bool logChannelId = false)
+    private async Task AppendFromTabAsync(string handle, string tab, int remaining, List<VideoInfo> sink, int daysWindow, bool logChannelId = false)
     {
         if (remaining <= 0) return;
         Diag.Print($"[WEB] Fetching /{tab} ...");
@@ -271,12 +272,14 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             Diag.Print($"[WEB][LIST {tab}] id={id} | title={title} | viewsText={viewsText} | publishedText={(publishedText ?? "(없음)")}");
             bool alwaysDbg = AlwaysDebug.EnabledFor(id);
             if (alwaysDbg)
-                Console.WriteLine($"[DBG][LIST {tab}] id={id} | publishedText={(publishedText ?? "(없음)")} | within48(list)={IsWithin48Hours(publishedText)}");
+                Console.WriteLine($"[DBG][LIST {tab}] id={id} | publishedText={(publishedText ?? "(없음)")} | withinWindow(list)={IsWithinWindow(publishedText, daysWindow)}");
 
             bool isShortsTab = string.Equals(tab, "shorts", StringComparison.OrdinalIgnoreCase);
 
             string? effectivePublished = publishedText;
             long? effectiveViews = views;
+            long? likeCount = null;
+            long? commentCount = null;
 
             if (isShortsTab)
             {
@@ -286,8 +289,10 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
                     var det = await GetWatchDetailsAsync(id);
                     effectivePublished = det.publishedText ?? publishedText;
                     effectiveViews = det.viewCount ?? views;
+                    likeCount = det.likeCount ?? likeCount;
+                    commentCount = det.commentCount ?? commentCount;
                     shortsDetailUsed++;
-                    if (!IsWithin48Hours(effectivePublished)) continue;
+                    if (!IsWithinWindow(effectivePublished, daysWindow)) continue;
                 }
                 else
                 {
@@ -298,26 +303,34 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             else
             {
                 // Videos/Streams: trust list-time; if it's within 48h, do NOT override with detail page
-                if (!IsWithin48Hours(publishedText))
+                if (!IsWithinWindow(publishedText, daysWindow))
                 {
                     if (alwaysDbg)
-                        Console.WriteLine($"[DBG][SKIP {tab}] id={id} | reason=list-within48=false");
+                        Console.WriteLine($"[DBG][SKIP {tab}] id={id} | reason=list-withinWindow=false");
                     continue;
                 }
                 if (alwaysDbg)
-                    Console.WriteLine($"[DBG][TRUST {tab}] id={id} | reason=list-within48=true (skip detail)");
+                    Console.WriteLine($"[DBG][TRUST {tab}] id={id} | reason=list-withinWindow=true (skip detail)");
                 // keep effectivePublished/effectiveViews as from list
+                // For streams, still fetch likes/comments from detail without trusting its published time
+                if (string.Equals(tab, "streams", StringComparison.OrdinalIgnoreCase))
+                {
+                    var det = await GetWatchDetailsAsync(id);
+                    likeCount = det.likeCount ?? likeCount;
+                    commentCount = det.commentCount ?? commentCount;
+                    effectiveViews = det.viewCount ?? effectiveViews;
+                }
             }
 
             Diag.Print($"[WEB][ADD {tab}] id={id} | published={(effectivePublished ?? "(없음)")} | views={(effectiveViews?.ToString() ?? "-")}");
             var typeStr = isShortsTab ? "shorts" : (string.Equals(tab, "streams", StringComparison.OrdinalIgnoreCase) ? "stream" : "video");
-            sink.Add(new VideoInfo(id, title, effectiveViews, null, null, typeStr));
+            sink.Add(new VideoInfo(id, title, effectiveViews, likeCount, commentCount, typeStr));
             added++;
             if (added >= remaining) break;
         }
     }
 
-    private async Task<(string? publishedText, long? viewCount)> GetWatchDetailsAsync(string videoId)
+    private async Task<(string? publishedText, long? viewCount, long? likeCount, long? commentCount)> GetWatchDetailsAsync(string videoId)
     {
         try
         {
@@ -341,6 +354,8 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
 
             // Extract initial data for published text/date
             string? published = null;
+            long? likeCount = null;
+            long? commentCount = null;
             var idata = ExtractJsonBlock(html, "ytInitialData");
             if (idata is not null)
             {
@@ -357,14 +372,40 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
                         if (!string.IsNullOrWhiteSpace(d)) published = d;
                     }
                 }
+
+                // Try to find like count text anywhere in initial data
+                var likeText = FindFirstStringContaining(idDoc.RootElement, new[] { "좋아요", "likes" });
+                if (!string.IsNullOrWhiteSpace(likeText))
+                {
+                    likeCount = TryParseSubscribers(likeText!); // reuse numeric + unit parser
+                }
+
+                // Try to find comments count (댓글 n개 / n comments)
+                var commentText = FindFirstStringContaining(idDoc.RootElement, new[] { "댓글", "comments" });
+                if (!string.IsNullOrWhiteSpace(commentText))
+                {
+                    commentCount = TryParseSubscribers(commentText!);
+                }
             }
 
-            return (published, viewCount);
+            // Fallback: search raw HTML for likes/comments text
+            if (likeCount is null)
+            {
+                var m1 = Regex.Match(html, @"(좋아요|likes)\s*([0-9][0-9,\. ]*)", RegexOptions.IgnoreCase);
+                if (m1.Success) likeCount = TryParseSubscribers(m1.Groups[2].Value);
+            }
+            if (commentCount is null)
+            {
+                var m2 = Regex.Match(html, @"(댓글|comments?)\s*([0-9][0-9,\. ]*)", RegexOptions.IgnoreCase);
+                if (m2.Success) commentCount = TryParseSubscribers(m2.Groups[2].Value);
+            }
+
+            return (published, viewCount, likeCount, commentCount);
         }
         catch (Exception ex)
         {
             Diag.Print($"[WEB][DETAIL] {videoId} detail fetch error: {ex.Message}");
-            return (null, null);
+            return (null, null, null, null);
         }
     }
 
@@ -390,6 +431,34 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             else if (cur.ValueKind == JsonValueKind.Array)
             {
                 foreach (var item in cur.EnumerateArray()) stack.Push(item);
+            }
+        }
+        return null;
+    }
+
+    private static string? FindFirstStringContaining(JsonElement root, string[] needles)
+    {
+        var stack = new Stack<JsonElement>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var cur = stack.Pop();
+            switch (cur.ValueKind)
+            {
+                case JsonValueKind.String:
+                    var s = cur.GetString();
+                    if (!string.IsNullOrEmpty(s))
+                    {
+                        var low = s.ToLowerInvariant();
+                        if (needles.Any(n => low.Contains(n))) return s;
+                    }
+                    break;
+                case JsonValueKind.Object:
+                    foreach (var p in cur.EnumerateObject()) stack.Push(p.Value);
+                    break;
+                case JsonValueKind.Array:
+                    foreach (var e in cur.EnumerateArray()) stack.Push(e);
+                    break;
             }
         }
         return null;
@@ -625,7 +694,7 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
         return long.TryParse(digits, out var v) ? v : null;
     }
 
-    private static bool IsWithin48Hours(string? publishedText)
+    private static bool IsWithinWindow(string? publishedText, int daysWindow)
     {
         if (string.IsNullOrWhiteSpace(publishedText)) return false;
         var s = publishedText.Trim().ToLowerInvariant();
@@ -644,8 +713,8 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             {
                 "second" => true,
                 "minute" => true,
-                "hour" => val < 48,
-                "day" => val < 2,
+                "hour" => val < daysWindow * 24,
+                "day" => val < daysWindow,
                 _ => false
             };
         }
@@ -660,8 +729,8 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             {
                 "초" => true,
                 "분" => true,
-                "시간" => val < 48,
-                "일" => val < 2,
+                "시간" => val < daysWindow * 24,
+                "일" => val < daysWindow,
                 _ => false
             };
         }

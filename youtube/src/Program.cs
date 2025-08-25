@@ -16,10 +16,13 @@ public static class Program
 
         // Parse flags and positional args
         bool debug = false;
+        int daysWindow = 2; // default 48h
         var positionals = new List<string>();
-        foreach (var a in args)
+        for (int i = 0; i < args.Length; i++)
         {
+            var a = args[i];
             if (a == "--debug" || a == "--verbose" || a == "-v") { debug = true; continue; }
+            if (a == "--days" && i + 1 < args.Length && int.TryParse(args[i + 1], out var d)) { daysWindow = Math.Max(1, d); i++; continue; }
             positionals.Add(a);
         }
         if (positionals.Count == 0)
@@ -53,7 +56,7 @@ public static class Program
 
         try
         {
-            var videos = await provider.GetRecentAsync(handle, maxResults);
+            var videos = await provider.GetRecentAsync(handle, maxResults, daysWindow);
             // Print result breakdown by type right after channel id logging
             var groups = videos
                 .GroupBy(v => (v.Type ?? "video").ToLowerInvariant())
