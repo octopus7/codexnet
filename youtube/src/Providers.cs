@@ -1,10 +1,13 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using YoutubeCli;
+using System.Globalization;
+using System.Text;
 
 namespace YoutubeCli.Providers;
 
-public record VideoInfo(string Id, string Title, long? ViewCount, long? LikeCount, long? CommentCount);
+public record VideoInfo(string Id, string Title, long? ViewCount, long? LikeCount, long? CommentCount, string Type);
 
 public interface IVideoProvider
 {
@@ -26,18 +29,29 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
             return new List<VideoInfo>();
         }
         Console.WriteLine($"[API] channelId: {channelId}");
+        var subsText = await GetSubscriberTextAsync(channelId);
+        Console.WriteLine($"[API] subscribers: {subsText}");
 
         var ids = await GetRecentVideoIdsAsync(channelId, Math.Clamp(maxResults, 1, 50));
         if (ids.Count == 0) return new List<VideoInfo>();
 
         var details = await GetVideoDetailsAsync(ids);
-        return details.Select(v => new VideoInfo(
-            v.Id ?? string.Empty,
-            v.Snippet?.Title ?? "(제목 없음)",
-            v.Statistics?.ViewCount,
-            v.Statistics?.LikeCount,
-            v.Statistics?.CommentCount
-        )).ToList();
+        return details.Select(v =>
+        {
+            var type = (v.Snippet?.LiveBroadcastContent?.ToLowerInvariant()) switch
+            {
+                "live" or "upcoming" => "stream",
+                _ => (TryParseIsoDurationSeconds(v.ContentDetails?.Duration) <= 60) ? "shorts" : "video"
+            };
+            return new VideoInfo(
+                v.Id ?? string.Empty,
+                v.Snippet?.Title ?? "(제목 없음)",
+                v.Statistics?.ViewCount,
+                v.Statistics?.LikeCount,
+                v.Statistics?.CommentCount,
+                type
+            );
+        }).ToList();
     }
 
     private async Task<string?> GetChannelIdByHandleAsync(string handle)
@@ -48,6 +62,27 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
         using var stream = await resp.Content.ReadAsStreamAsync();
         var data = await JsonSerializer.DeserializeAsync<ChannelsListResponse>(stream);
         return data?.Items?.FirstOrDefault()?.Id;
+    }
+
+    private async Task<string> GetSubscriberTextAsync(string channelId)
+    {
+        try
+        {
+            var url = $"https://www.googleapis.com/youtube/v3/channels?part=statistics&id={Uri.EscapeDataString(channelId)}&key={Uri.EscapeDataString(_apiKey)}";
+            using var resp = await _http.GetAsync(url);
+            resp.EnsureSuccessStatusCode();
+            using var stream = await resp.Content.ReadAsStreamAsync();
+            var doc = await JsonSerializer.DeserializeAsync<ChannelsStatsResponse>(stream);
+            var st = doc?.Items?.FirstOrDefault()?.Statistics;
+            if (st is null) return "unknown";
+            if (st.HiddenSubscriberCount == true) return "hidden";
+            if (long.TryParse(st.SubscriberCount, out var n)) return n.ToString("N0", CultureInfo.InvariantCulture);
+            return st.SubscriberCount ?? "unknown";
+        }
+        catch
+        {
+            return "unknown";
+        }
     }
 
     private async Task<List<string>> GetRecentVideoIdsAsync(string channelId, int maxResults)
@@ -67,12 +102,28 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
     private async Task<List<Video>> GetVideoDetailsAsync(List<string> ids)
     {
         var idParam = string.Join(',', ids);
-        var url = $"https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id={Uri.EscapeDataString(idParam)}&key={Uri.EscapeDataString(_apiKey)}";
+        var url = $"https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics,contentDetails&id={Uri.EscapeDataString(idParam)}&key={Uri.EscapeDataString(_apiKey)}";
         using var resp = await _http.GetAsync(url);
         resp.EnsureSuccessStatusCode();
         using var stream = await resp.Content.ReadAsStreamAsync();
         var data = await JsonSerializer.DeserializeAsync<VideosListResponse>(stream);
         return data?.Items ?? new List<Video>();
+    }
+
+    private static int TryParseIsoDurationSeconds(string? iso)
+    {
+        if (string.IsNullOrWhiteSpace(iso)) return int.MaxValue;
+        try
+        {
+            // Simple parser for PT#M#S
+            var m = Regex.Match(iso, @"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?");
+            if (!m.Success) return int.MaxValue;
+            int h = m.Groups[1].Success ? int.Parse(m.Groups[1].Value) : 0;
+            int mn = m.Groups[2].Success ? int.Parse(m.Groups[2].Value) : 0;
+            int s = m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0;
+            return h * 3600 + mn * 60 + s;
+        }
+        catch { return int.MaxValue; }
     }
 
     // DTOs for API responses
@@ -83,6 +134,19 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
     private sealed class ChannelItem
     {
         [JsonPropertyName("id")] public string? Id { get; set; }
+    }
+    private sealed class ChannelsStatsResponse
+    {
+        [JsonPropertyName("items")] public List<ChannelStatsItem>? Items { get; set; }
+    }
+    private sealed class ChannelStatsItem
+    {
+        [JsonPropertyName("statistics")] public ChannelStatistics? Statistics { get; set; }
+    }
+    private sealed class ChannelStatistics
+    {
+        [JsonPropertyName("subscriberCount")] public string? SubscriberCount { get; set; }
+        [JsonPropertyName("hiddenSubscriberCount")] public bool? HiddenSubscriberCount { get; set; }
     }
     private sealed class SearchListResponse
     {
@@ -105,10 +169,16 @@ public sealed class ApiVideoProvider(HttpClient http, string apiKey) : IVideoPro
         [JsonPropertyName("id")] public string? Id { get; set; }
         [JsonPropertyName("snippet")] public VideoSnippet? Snippet { get; set; }
         [JsonPropertyName("statistics")] public VideoStatistics? Statistics { get; set; }
+        [JsonPropertyName("contentDetails")] public VideoContentDetails? ContentDetails { get; set; }
     }
     private sealed class VideoSnippet
     {
         [JsonPropertyName("title")] public string? Title { get; set; }
+        [JsonPropertyName("liveBroadcastContent")] public string? LiveBroadcastContent { get; set; }
+    }
+    private sealed class VideoContentDetails
+    {
+        [JsonPropertyName("duration")] public string? Duration { get; set; }
     }
     private sealed class VideoStatistics
     {
@@ -143,11 +213,11 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
     private async Task AppendFromTabAsync(string handle, string tab, int remaining, List<VideoInfo> sink, bool logChannelId = false)
     {
         if (remaining <= 0) return;
-        Console.WriteLine($"[WEB] Fetching /{tab} ...");
+        Diag.Print($"[WEB] Fetching /{tab} ...");
         var url = $"https://www.youtube.com/{Uri.EscapeDataString(handle)}/{tab}?hl=ko";
         using var resp = await _http.GetAsync(url);
         resp.EnsureSuccessStatusCode();
-        var html = await resp.Content.ReadAsStringAsync();
+        var html = await ReadAndCountAsync(resp);
 
         var json = ExtractJsonBlock(html, "ytInitialData");
         if (json is null) return;
@@ -158,6 +228,20 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             Console.WriteLine($"[WEB] Resolving channelId for {handle} ...");
             var channelId = FindChannelId(doc.RootElement);
             Console.WriteLine(channelId is null ? "[WEB] channelId not found (parsing)." : $"[WEB] channelId: {channelId}");
+            var subText = FindSubscriberText(doc.RootElement);
+            string subsOut = "unknown";
+            if (string.IsNullOrWhiteSpace(subText))
+            {
+                // Fallback: fetch channel root page to read header subscriber text
+                var fetched = await FetchSubscriberTextForHandle(handle);
+                subText = fetched;
+            }
+            if (!string.IsNullOrWhiteSpace(subText))
+            {
+                var parsed = TryParseSubscribers(subText!);
+                subsOut = parsed.HasValue ? parsed.Value.ToString("N0", CultureInfo.InvariantCulture) : subText!;
+            }
+            Console.WriteLine($"[WEB] subscribers: {subsOut}");
         }
 
         int added = 0;
@@ -184,7 +268,7 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
                                 TryGetText(renderer, ["accessibility", "accessibilityData", "label"]);
 
             // Log candidate prior to filtering, with tab context
-            Console.WriteLine($"[WEB][LIST {tab}] id={id} | title={title} | viewsText={viewsText} | publishedText={(publishedText ?? "(없음)")}");
+            Diag.Print($"[WEB][LIST {tab}] id={id} | title={title} | viewsText={viewsText} | publishedText={(publishedText ?? "(없음)")}");
 
             bool isShortsTab = string.Equals(tab, "shorts", StringComparison.OrdinalIgnoreCase);
 
@@ -218,8 +302,9 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
                 if (!IsWithin48Hours(effectivePublished)) continue;
             }
 
-            Console.WriteLine($"[WEB][ADD {tab}] id={id} | published={(effectivePublished ?? "(없음)")} | views={(effectiveViews?.ToString() ?? "-")}");
-            sink.Add(new VideoInfo(id, title, effectiveViews, null, null));
+            Diag.Print($"[WEB][ADD {tab}] id={id} | published={(effectivePublished ?? "(없음)")} | views={(effectiveViews?.ToString() ?? "-")}");
+            var typeStr = isShortsTab ? "shorts" : (string.Equals(tab, "streams", StringComparison.OrdinalIgnoreCase) ? "stream" : "video");
+            sink.Add(new VideoInfo(id, title, effectiveViews, null, null, typeStr));
             added++;
             if (added >= remaining) break;
         }
@@ -232,7 +317,7 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             var url = $"https://www.youtube.com/watch?v={Uri.EscapeDataString(videoId)}&hl=ko";
             using var resp = await _http.GetAsync(url);
             resp.EnsureSuccessStatusCode();
-            var html = await resp.Content.ReadAsStringAsync();
+            var html = await ReadAndCountAsync(resp);
 
             // Extract player response for viewCount
             long? viewCount = null;
@@ -271,7 +356,7 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[WEB][DETAIL] {videoId} detail fetch error: {ex.Message}");
+            Diag.Print($"[WEB][DETAIL] {videoId} detail fetch error: {ex.Message}");
             return (null, null);
         }
     }
@@ -301,6 +386,106 @@ public sealed class WebVideoProvider(HttpClient http) : IVideoProvider
             }
         }
         return null;
+    }
+
+    private static string? FindSubscriberText(JsonElement root)
+    {
+        // Try common paths for subscriberCountText in header
+        // It often appears as { subscriberCountText: { simpleText: "구독자 N명" } }
+        var stack = new Stack<JsonElement>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var cur = stack.Pop();
+            if (cur.ValueKind == JsonValueKind.Object)
+            {
+                if (cur.TryGetProperty("subscriberCountText", out var sct))
+                {
+                    var txt = TryGetText(sct, Array.Empty<string>());
+                    if (!string.IsNullOrWhiteSpace(txt)) return txt;
+                }
+                foreach (var prop in cur.EnumerateObject()) stack.Push(prop.Value);
+            }
+            else if (cur.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in cur.EnumerateArray()) stack.Push(item);
+            }
+        }
+        return null;
+    }
+
+    private async Task<string?> FetchSubscriberTextForHandle(string handle)
+    {
+        try
+        {
+            foreach (var tab in new[] { "", "about" })
+            {
+                var url = $"https://www.youtube.com/{Uri.EscapeDataString(handle)}/{tab}?hl=ko".TrimEnd('/');
+                using var resp = await _http.GetAsync(url);
+                if (!resp.IsSuccessStatusCode) continue;
+                var html = await ReadAndCountAsync(resp);
+                var json = ExtractJsonBlock(html, "ytInitialData");
+                if (json is null) continue;
+                using var doc = JsonDocument.Parse(json);
+                var txt = FindSubscriberText(doc.RootElement);
+                if (!string.IsNullOrWhiteSpace(txt)) return txt;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static async Task<string> ReadAndCountAsync(HttpResponseMessage resp)
+    {
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        Diag.AddTraffic(bytes.LongLength);
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    private static long? TryParseSubscribers(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var s = text.Trim().ToLowerInvariant();
+        // remove common words
+        s = s.Replace("구독자", string.Empty)
+             .Replace("구독", string.Empty)
+             .Replace("명", string.Empty)
+             .Replace("subscriber", string.Empty)
+             .Replace("subscribers", string.Empty)
+             .Trim();
+
+        // capture number and optional unit
+        var m = Regex.Match(s, @"([0-9]+(?:[\.,][0-9]+)?)\s*(천|만|억|k|m|b)?");
+        if (!m.Success) return null;
+        var numPart = m.Groups[1].Value;
+        var unit = m.Groups[2].Success ? m.Groups[2].Value : string.Empty;
+
+        // normalize decimal separator: keep '.' as decimal, remove thousand commas
+        if (numPart.Contains('.') && numPart.Contains(','))
+            numPart = numPart.Replace(",", string.Empty);
+        else if (!numPart.Contains('.'))
+            numPart = numPart.Replace(",", string.Empty);
+
+        if (!double.TryParse(numPart, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+        {
+            // Try parsing with current culture as fallback
+            if (!double.TryParse(numPart, out value)) return null;
+        }
+
+        double scale = unit switch
+        {
+            "천" => 1_000d,
+            "만" => 10_000d,
+            "억" => 100_000_000d,
+            "k" => 1_000d,
+            "m" => 1_000_000d,
+            "b" => 1_000_000_000d,
+            _ => 1d
+        };
+
+        var result = Math.Round(value * scale);
+        if (result < 0 || result > long.MaxValue) return null;
+        return (long)result;
     }
 
     private static IEnumerable<JsonElement> FindVideoRenderers(JsonElement root)
